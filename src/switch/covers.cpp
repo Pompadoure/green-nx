@@ -12,13 +12,17 @@ namespace gnx {
 Covers::Covers(gfx::Gfx& gfx, std::string cache_dir)
     : gfx_(gfx), cache_dir_(std::move(cache_dir)) {
     mkdir(cache_dir_.c_str(), 0755);
-    thread_ = std::thread(&Covers::worker, this);
+    disk_thread_ = std::thread(&Covers::disk_worker, this);
+    net_thread_ = std::thread(&Covers::net_worker, this);
 }
 
 Covers::~Covers() {
     quit_ = true;
     wake_.notify_all();
-    if (thread_.joinable()) thread_.join();
+    if (disk_thread_.joinable()) disk_thread_.join();
+    if (net_thread_.joinable()) net_thread_.join();
+    for (Done& done : done_)
+        if (done.surface) SDL_FreeSurface(done.surface);
     for (auto& [key, texture] : textures_)
         if (texture) SDL_DestroyTexture(texture);
 }
@@ -31,14 +35,14 @@ SDL_Texture* Covers::get(const std::string& title_id, const std::string& url) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!pending_.count(title_id)) {
         pending_.insert(title_id);
-        jobs_.push_back({title_id, url});
-        wake_.notify_one();
+        disk_jobs_.push_back({title_id, url});
+        wake_.notify_all();
     }
     return nullptr;
 }
 
 void Covers::pump() {
-    for (int budget = 0; budget < 3; ++budget) {
+    for (int budget = 0; budget < 2; ++budget) {
         Done done;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -46,13 +50,8 @@ void Covers::pump() {
             done = std::move(done_.front());
             done_.pop_front();
         }
-        SDL_Texture* texture =
-            done.bytes.empty()
-                ? nullptr
-                : gfx_.texture_from_memory(done.bytes.data(),
-                                           done.bytes.size());
         // Negative results are cached as nullptr so we don't retry every frame.
-        textures_[done.title_id] = texture;
+        textures_[done.title_id] = gfx_.texture_from_surface(done.surface);
     }
 }
 
@@ -62,44 +61,72 @@ void Covers::drop_textures() {
     textures_.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.clear();  // allow re-queue after the renderer is rebuilt
-    done_.clear();     // bytes decoded for the old renderer are useless
+    for (Done& done : done_)
+        if (done.surface) SDL_FreeSurface(done.surface);
+    done_.clear();
 }
 
-void Covers::worker() {
+void Covers::finish(const std::string& title_id,
+                    const std::vector<char>& bytes) {
+    SDL_Surface* surface =
+        bytes.empty() ? nullptr
+                      : gfx::Gfx::decode_image(bytes.data(), bytes.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    done_.push_back({title_id, surface});
+}
+
+void Covers::disk_worker() {
+    while (!quit_) {
+        Job job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [&] { return quit_ || !disk_jobs_.empty(); });
+            if (quit_) return;
+            job = std::move(disk_jobs_.back());
+            disk_jobs_.pop_back();
+        }
+
+        std::ifstream cached(cache_dir_ + "/" + job.title_id + ".img",
+                             std::ios::binary);
+        if (cached) {
+            std::vector<char> bytes;
+            bytes.assign(std::istreambuf_iterator<char>(cached), {});
+            finish(job.title_id, bytes);
+        } else {
+            std::lock_guard<std::mutex> lock(mutex_);
+            net_jobs_.push_back(std::move(job));
+            wake_.notify_all();
+        }
+    }
+}
+
+void Covers::net_worker() {
     Http http;
     http.set_abort_flag(&quit_);  // unblock in-flight download on shutdown
     while (!quit_) {
         Job job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            wake_.wait(lock, [&] { return quit_ || !jobs_.empty(); });
+            wake_.wait(lock, [&] { return quit_ || !net_jobs_.empty(); });
             if (quit_) return;
-            job = std::move(jobs_.front());
-            jobs_.pop_front();
+            job = std::move(net_jobs_.back());
+            net_jobs_.pop_back();
         }
 
-        std::string path = cache_dir_ + "/" + job.title_id + ".img";
         std::vector<char> bytes;
-
-        std::ifstream cached(path, std::ios::binary);
-        if (cached) {
-            bytes.assign(std::istreambuf_iterator<char>(cached), {});
-        } else {
-            try {
-                HttpResponse response = http.get(job.url);
-                if (response.ok() && !response.body.empty()) {
-                    bytes.assign(response.body.begin(), response.body.end());
-                    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-                    out.write(bytes.data(),
-                              static_cast<std::streamsize>(bytes.size()));
-                }
-            } catch (const std::exception&) {
-                // Leave bytes empty; pump() caches the miss.
+        try {
+            HttpResponse response = http.get(job.url);
+            if (response.ok() && !response.body.empty()) {
+                bytes.assign(response.body.begin(), response.body.end());
+                std::ofstream out(cache_dir_ + "/" + job.title_id + ".img",
+                                  std::ios::binary | std::ios::trunc);
+                out.write(bytes.data(),
+                          static_cast<std::streamsize>(bytes.size()));
             }
+        } catch (const std::exception&) {
+            // Leave bytes empty; pump() caches the miss.
         }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        done_.push_back({job.title_id, std::move(bytes)});
+        finish(job.title_id, bytes);
     }
 }
 

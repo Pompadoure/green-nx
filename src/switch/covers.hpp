@@ -16,9 +16,11 @@
 
 namespace gnx {
 
-// Box-art cache: downloads covers on a worker thread to the SD card, decodes
-// them off the render thread, and hands raw bytes to the main thread which
-// turns them into textures (SDL textures must be created on the render thread).
+// Box-art cache: one worker reads covers from the SD card, another downloads
+// the rest, and both decode off the render thread. The main thread only uploads
+// the decoded surfaces (SDL textures must be created on the render thread).
+// Both queues run newest first, so what is on screen after a fast scroll loads
+// ahead of the covers that were scrolled past.
 class Covers {
 public:
     Covers(gfx::Gfx& gfx, std::string cache_dir);
@@ -35,7 +37,9 @@ public:
     void drop_textures();
 
 private:
-    void worker();
+    void disk_worker();
+    void net_worker();
+    void finish(const std::string& title_id, const std::vector<char>& bytes);
 
     gfx::Gfx& gfx_;
     std::string cache_dir_;
@@ -49,15 +53,17 @@ private:
     };
     struct Done {
         std::string title_id;
-        std::vector<char> bytes;
+        SDL_Surface* surface;  // nullptr: nothing usable for this title
     };
 
     std::mutex mutex_;
     std::condition_variable wake_;
-    std::deque<Job> jobs_;
+    std::deque<Job> disk_jobs_;
+    std::deque<Job> net_jobs_;
     std::deque<Done> done_;
     std::atomic<bool> quit_{false};
-    std::thread thread_;
+    std::thread disk_thread_;
+    std::thread net_thread_;
 };
 
 }  // namespace gnx

@@ -170,8 +170,15 @@ int Gfx::text_width(const std::string& utf8, FontSize size) {
 }
 
 SDL_Texture* Gfx::texture_from_memory(const void* data, size_t size) {
+    return texture_from_surface(decode_image(data, size));
+}
+
+SDL_Surface* Gfx::decode_image(const void* data, size_t size) {
     SDL_RWops* rw = SDL_RWFromConstMem(data, size);
-    SDL_Surface* surface = IMG_Load_RW(rw, 1);
+    return rw ? IMG_Load_RW(rw, 1) : nullptr;
+}
+
+SDL_Texture* Gfx::texture_from_surface(SDL_Surface* surface) {
     if (!surface) return nullptr;
     SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
     SDL_FreeSurface(surface);

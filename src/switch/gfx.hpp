@@ -60,6 +60,10 @@ public:
     int text_width(const std::string& utf8, FontSize size);
 
     SDL_Texture* texture_from_memory(const void* data, size_t size);
+    // Decoding touches no renderer state, so it is safe on a worker thread.
+    static SDL_Surface* decode_image(const void* data, size_t size);
+    // Creates the texture and frees the surface. Render thread only.
+    SDL_Texture* texture_from_surface(SDL_Surface* surface);
     void draw_texture(SDL_Texture* texture, const SDL_Rect& destination);
 
     // Simple pulsing loading dot row.

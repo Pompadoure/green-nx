@@ -1512,6 +1512,17 @@ void draw_library(App& app) {
 
     // Draw the focused card last so its scale/glow overlaps neighbours.
     int first_row = std::max(0, app.cursor / kColumns - (kRowsVisible - 1));
+    // Ask for the rows just off screen first: the cover queue runs newest
+    // first, so what is on screen still wins.
+    const int total = static_cast<int>(app.visible.size());
+    const int shown_end = (first_row + kRowsVisible) * kColumns;
+    for (int index = shown_end + 2 * kColumns - 1;
+         index >= (first_row - 1) * kColumns; --index) {
+        if (index >= (first_row + 0) * kColumns && index < shown_end) continue;
+        if (index < 0 || index >= total) continue;
+        const Game& game = app.games[app.visible[index]];
+        app.covers->get(game.title_id, game.box_art_url);
+    }
     int focused_slot = -1;
     for (int slot = 0; slot < kColumns * (kRowsVisible + 1); ++slot) {
         int index = first_row * kColumns + slot;
@@ -2379,6 +2390,9 @@ struct Input {
     bool touch = false;            // a finger tapped this frame
     int touch_x = 0, touch_y = 0;  // tap position in 1920x1080 design space
     int swipe_rows = 0;            // vertical swipe -> grid rows to scroll
+    // Auto-repeat of a held direction; each screen picks what it honours.
+    bool repeat_up = false, repeat_down = false;
+    bool repeat_left = false, repeat_right = false;
 };
 
 Input poll_input(SDL_Joystick*& joystick) {
@@ -2580,6 +2594,31 @@ Input poll_input(SDL_Joystick*& joystick) {
         if (dy < 0 && last_y >= 0) input.up = true;
         last_x = dx;
         last_y = dy;
+
+        // Holding a direction keeps stepping, on the stick and the d-pad.
+        // The pace picks up after a while so long lists stay quick to cross.
+        constexpr Uint32 kFirstDelay = 300, kRepeat = 110, kFastRepeat = 50;
+        constexpr Uint32 kFastAfter = 1500;
+        static int held = 0;  // 1 up, 2 down, 3 left, 4 right
+        static Uint32 held_since = 0, next_step = 0;
+        int dir = 0;
+        if (dy < 0 || SDL_JoystickGetButton(joystick, kBtnUp)) dir = 1;
+        else if (dy > 0 || SDL_JoystickGetButton(joystick, kBtnDown)) dir = 2;
+        else if (dx < 0 || SDL_JoystickGetButton(joystick, kBtnLeft)) dir = 3;
+        else if (dx > 0 || SDL_JoystickGetButton(joystick, kBtnRight)) dir = 4;
+        Uint32 now = SDL_GetTicks();
+        if (dir != held) {
+            held = dir;
+            held_since = now;
+            next_step = now + kFirstDelay;
+        } else if (dir != 0 && now >= next_step) {
+            next_step = now + (now - held_since > kFastAfter ? kFastRepeat
+                                                             : kRepeat);
+            input.repeat_up = dir == 1;
+            input.repeat_down = dir == 2;
+            input.repeat_left = dir == 3;
+            input.repeat_right = dir == 4;
+        }
     }
     return input;
 }
@@ -2656,6 +2695,14 @@ int main(int argc, char** argv) {
     while (running) {
         Input input = poll_input(joystick);
         if (input.quit) break;
+        if (app.scene == Scene::Library || app.scene == Scene::Settings) {
+            input.up |= input.repeat_up;
+            input.down |= input.repeat_down;
+        }
+        if (app.scene == Scene::Library) {  // left/right change Settings values
+            input.left |= input.repeat_left;
+            input.right |= input.repeat_right;
+        }
 #ifdef GNX_NATIVE_STREAM
         // A zombie handle is invisible in the stream log otherwise, and a
         // controller that died right then is exactly what gets reported.
