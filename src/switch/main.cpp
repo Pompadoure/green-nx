@@ -40,8 +40,12 @@
 #endif
 
 #ifdef __SWITCH__
+// Global + hidden: the assembler folds local labels into their section, so
+// GOT references would all resolve to the same address.
 __asm__(
     ".pushsection .rodata\n"
+    ".global gnx_logo_png\n .hidden gnx_logo_png\n"
+    ".global gnx_logo_png_end\n .hidden gnx_logo_png_end\n"
     "gnx_logo_png:\n .incbin \"xbox_logo.png\"\n"
     "gnx_logo_png_end:\n"
     ".popsection\n");

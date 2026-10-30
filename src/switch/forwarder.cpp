@@ -29,8 +29,14 @@
         if (R_FAILED(rc_)) return rc_; \
     } while (0)
 
+// Global + hidden: the assembler folds local labels into their section, so
+// GOT references would all resolve to the same address.
 __asm__(
     ".pushsection .rodata\n"
+    ".global gnx_hbl_main\n .hidden gnx_hbl_main\n"
+    ".global gnx_hbl_main_end\n .hidden gnx_hbl_main_end\n"
+    ".global gnx_hbl_npdm\n .hidden gnx_hbl_npdm\n"
+    ".global gnx_hbl_npdm_end\n .hidden gnx_hbl_npdm_end\n"
     "gnx_hbl_main:\n .incbin \"hbl/main\"\n"
     "gnx_hbl_main_end:\n"
     "gnx_hbl_npdm:\n .incbin \"hbl/main.npdm\"\n"
