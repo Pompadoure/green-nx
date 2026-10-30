@@ -13,6 +13,7 @@ struct Game {
     std::string product_id;  // Microsoft Store bigId, for metadata lookup
     std::string name;        // filled by fetch_names()
     std::string box_art_url;
+    std::string icon_url;    // square art for a home screen shortcut
 
     // How this account can reach the title. Several can be true at once: a
     // game you own is usually in the subscription catalog as well.

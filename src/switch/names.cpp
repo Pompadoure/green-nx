@@ -57,6 +57,7 @@ bool Names::pump(std::vector<Game>& games) {
         if (found == by_product.end() || !game.name.empty()) continue;
         game.name = found->second->name;
         game.box_art_url = found->second->box_art_url;
+        game.icon_url = found->second->icon_url;
         changed = true;
     }
     return changed;

@@ -30,6 +30,7 @@
 #include "../core/auth.hpp"
 #include "../core/catalog.hpp"
 #include "covers.hpp"
+#include "forwarder.hpp"
 #include "gfx.hpp"
 #include "names.hpp"
 #include "qr.hpp"
@@ -396,7 +397,11 @@ struct App {
     Scene settings_return = Scene::Library;  // scene to go back to from Settings
     bool signout_armed = false;  // Settings sign-out row: first A arms, second confirms
     int detail_index = -1;   // games[] index shown in Scene::Detail
-    int detail_cursor = 0;   // 0 = Play, 1 = favorite, 2 = Play on... (if any)
+    int detail_cursor = 0;   // Play, favorite, Play on... (if any), home screen
+    bool home_installed = false;  // the detail title has a HOME shortcut
+    std::atomic<int> home_state{0};  // 0 idle, 1 working, 2 result is ready
+    std::string home_result;  // written by the worker, read at state 2
+    std::string home_note;    // shown on the detail screen
     std::vector<HomeConsole> consoles;  // linked Xboxes; empty = hide feature
     bool launching_home = false;        // what the current stream targets
     int console_cursor = 0;             // selected console (list + launches)
@@ -518,6 +523,7 @@ void save_games_cache(const std::vector<Game>& games) {
                         {"productId", game.product_id},
                         {"name", game.name},
                         {"boxArt", game.box_art_url},
+                        {"icon", game.icon_url},
                         {"owned", game.owned},
                         {"sub", game.subscription},
                         {"mySub", game.in_subscription},
@@ -543,6 +549,7 @@ std::vector<Game> load_games_cache() {
         game.product_id = entry.value("productId", "");
         game.name = entry.value("name", "");
         game.box_art_url = entry.value("boxArt", "");
+        game.icon_url = entry.value("icon", "");
         game.owned = entry.value("owned", false);
         game.subscription = entry.value("sub", false);
         game.in_subscription = entry.value("mySub", false);
@@ -758,6 +765,42 @@ void start_library_load(App& app, bool force_refresh) {
 
 void join_worker(App& app) {
     if (app.worker.joinable()) app.worker.join();
+}
+
+// Add or remove the HOME menu shortcut of the detail title, off the UI thread.
+void start_home_action(App& app, const Game& game) {
+    join_worker(app);
+    const bool remove = app.home_installed;
+    const std::string id = game.title_id;
+    const std::string name = game.name.empty() ? id : game.name;
+    std::string url = game.icon_url;
+    if (url.empty()) {  // library cached before icon_url existed
+        url = game.box_art_url;
+        const size_t height = url.rfind("?h=300");
+        if (height != std::string::npos) url.replace(height, 6, "?h=512");
+    }
+    app.home_note = remove ? "Removing from the home screen..."
+                           : "Adding to the home screen...";
+    app.home_state = 1;
+    app.worker = std::thread([&app, remove, id, name, url] {
+        std::string error;
+        try {
+            if (remove) {
+                error = forwarder::remove(id);
+            } else {
+                Http http;
+                HttpResponse image = http.get(url);
+                error = image.ok() ? forwarder::install(id, name, image.body)
+                                   : "Could not download the cover";
+            }
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        app.home_result = !error.empty() ? error
+                          : remove       ? "Removed from the home screen"
+                                         : "Added to the home screen";
+        app.home_state = 2;
+    });
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -1470,6 +1513,8 @@ void draw_library(App& app) {
 
 // Game detail (card 1f): big cover left, title + meta chips + action buttons
 // right. Play is focused on entry, so A-A launches as fast as before.
+int home_row(const App& app) { return app.consoles.empty() ? 2 : 3; }
+
 void draw_detail(App& app) {
     if (app.detail_index < 0 ||
         app.detail_index >= static_cast<int>(app.games.size()))
@@ -1539,9 +1584,17 @@ void draw_detail(App& app) {
                          app.gfx.text_width(target, gfx::FontSize::Body),
                      source.y + 24, gfx::FontSize::Body, gfx::kTextDim);
     }
+    SDL_Rect homebtn = {rx, app.consoles.empty() ? 640 : 760, 640, 96};
+    app.gfx.fill(homebtn, gfx::kSurface);
+    app.gfx.text_centered(app.home_installed ? "Remove from home screen"
+                                             : "Add to home screen",
+                          homebtn.x + 320, homebtn.y + 24, gfx::FontSize::Body,
+                          app.home_installed || can_play ? gfx::kText
+                                                         : gfx::kTextDim);
     SDL_Rect focused = app.detail_cursor == 0   ? play
                        : app.detail_cursor == 1 ? favbtn
-                                                : source;
+                       : app.detail_cursor == home_row(app) ? homebtn
+                                                            : source;
     draw_focus_frames(app, focused);
 
     std::string note;
@@ -1558,8 +1611,8 @@ void draw_detail(App& app) {
     if (game.needs_ad_offering() && game.max_session_secs > 0)
         note += " · sessions end after " +
                 std::to_string(game.max_session_secs / 60) + " minutes";
-    app.gfx.text(note, rx, app.consoles.empty() ? 680 : 792,
-                 gfx::FontSize::Small, gfx::kFaint);
+    if (!app.home_note.empty()) note = app.home_note;
+    app.gfx.text(note, rx, homebtn.y + 120, gfx::FontSize::Small, gfx::kFaint);
 
     draw_hints(app, {{"A", "Select", true}, {"B", "Back"}});
 }
@@ -2811,6 +2864,9 @@ int main(int argc, char** argv) {
                     // so A-A still launches as fast as direct launch did.
                     app.detail_index = app.visible[app.cursor];
                     app.detail_cursor = 0;
+                    app.home_note.clear();
+                    app.home_installed = forwarder::installed(
+                        app.games[app.detail_index].title_id);
                     app.scene = Scene::Detail;
                 }
                 if (input.plus) running = false;
@@ -2818,7 +2874,15 @@ int main(int argc, char** argv) {
             }
 
             case Scene::Detail: {
-                int last = app.consoles.empty() ? 1 : 2;
+                if (app.home_state == 1) break;  // installing: hold the screen
+                if (app.home_state == 2) {
+                    join_worker(app);
+                    app.home_state = 0;
+                    app.home_note = app.home_result;
+                    app.home_installed = forwarder::installed(
+                        app.games[app.detail_index].title_id);
+                }
+                int last = home_row(app);
                 if (input.up)
                     app.detail_cursor = std::max(0, app.detail_cursor - 1);
                 if (input.down)
@@ -2827,7 +2891,10 @@ int main(int argc, char** argv) {
                 if (input.a && app.detail_index >= 0 &&
                     app.detail_index < static_cast<int>(app.games.size())) {
                     const Game& game = app.games[app.detail_index];
-                    if (app.detail_cursor == 1) {
+                    if (app.detail_cursor == home_row(app)) {
+                        if (app.home_installed || game.playable())
+                            start_home_action(app, game);
+                    } else if (app.detail_cursor == 1) {
                         toggle_favorite(app, game.title_id);
                         apply_filter(app);
                     } else if (app.detail_cursor == 2) {

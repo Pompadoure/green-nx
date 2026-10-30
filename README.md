@@ -52,6 +52,13 @@ involved.
 | Settings | Stream quality (720p / 1080p / 1080p HQ) · button layout (positional / labels) |
 | In stream | Xbox controls mapped from the Switch pad · hold **-** + **+** to quit |
 
+### Home screen shortcuts
+
+On a game's page, **Add to home screen** installs a shortcut with the game's
+cover, and **Remove from home screen** takes it away again. Everything happens
+on the console and needs no prod.keys. It only works on emuMMC, and the app has
+to stay at `sdmc:/switch/green-nx/green-nx.nro`.
+
 ### Direct launch
 
 Start green-nx with `--appid=<xCloud id>` (for example from a forwarder) and it

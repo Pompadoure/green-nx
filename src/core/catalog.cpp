@@ -241,6 +241,8 @@ void fetch_names(Http& http, const std::vector<Game*>& games,
             const std::string& uri = !poster.empty() ? poster : box_art;
             if (!uri.empty())
                 found->second->box_art_url = "https:" + uri + "?h=300";
+            if (!box_art.empty())
+                found->second->icon_url = "https:" + box_art + "?w=256&h=256";
         }
     }
 }
