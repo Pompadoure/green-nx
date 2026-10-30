@@ -787,22 +787,27 @@ void start_home_action(App& app, const Game& game) {
     const bool remove = app.home_installed;
     const std::string id = game.title_id;
     const std::string name = game.name.empty() ? id : game.name;
-    std::string url = game.icon_url;
-    if (url.empty()) {  // library cached before icon_url existed
-        url = game.box_art_url;
-        const size_t height = url.rfind("?h=300");
-        if (height != std::string::npos) url.replace(height, 6, "?h=512");
-    }
+    const std::string product_id = game.product_id;
+    const std::string icon_url = game.icon_url;
+    const std::string cover_url = game.box_art_url;
     app.home_note = remove ? "Removing from the home screen..."
                            : "Adding to the home screen...";
     app.home_state = 1;
-    app.worker = std::thread([&app, remove, id, name, url] {
+    app.worker = std::thread([&app, remove, id, name, product_id, icon_url,
+                              cover_url] {
         std::string error;
         try {
             if (remove) {
                 error = forwarder::remove(id);
             } else {
                 Http http;
+                std::string url = icon_url;
+                if (url.empty()) {  // library cached before icon_url existed
+                    Game lookup;
+                    lookup.product_id = product_id;
+                    fetch_names(http, std::vector<Game*>{&lookup});
+                    url = lookup.icon_url.empty() ? cover_url : lookup.icon_url;
+                }
                 HttpResponse image = http.get(url);
                 error = image.ok() ? forwarder::install(id, name, image.body)
                                    : "Could not download the cover";
