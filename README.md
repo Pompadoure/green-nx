@@ -52,6 +52,16 @@ involved.
 | Settings | Stream quality (720p / 1080p / 1080p HQ) · button layout (positional / labels) |
 | In stream | Xbox controls mapped from the Switch pad · hold **-** + **+** to quit |
 
+### Direct launch
+
+Start green-nx with `--appid=<xCloud id>` (for example from a forwarder) and it
+skips the library, goes straight into that game and exits when the stream ends.
+The Moonlight mode of the
+[NSP Forwarder Generator](https://nsp-forwarder.vercel.app/moonlight) writes
+this argument: set **Moonlight Path** to `/switch/green-nx/green-nx.nro`, **Host
+IP** to any value (it is ignored) and **App ID** to the title id, for example
+`HALOINFINITE`.
+
 ## Build
 
 No local toolchain needed — everything builds inside the

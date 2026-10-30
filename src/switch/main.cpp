@@ -9,6 +9,7 @@
 #include <switch.h>
 #endif
 
+#include <strings.h>  // strcasecmp: matching a forwarder's --appid
 #include <sys/stat.h>
 #include <unistd.h>  // rmdir: removing an account's directory
 
@@ -385,6 +386,9 @@ struct App {
     std::string load_error;
     std::string gamertag;
     Game launch_game;
+    std::string direct_title;   // --appid from a forwarder, until launched
+    bool direct_refreshed = false;  // already reloaded the library for it
+    bool direct_launch = false;     // leave the app when the stream ends
     Settings settings;
     int settings_cursor = 0;
     int accounts_cursor = 0;  // Scene::Accounts: row in the account picker
@@ -2219,6 +2223,39 @@ void log_fatal(const std::string& message) {
 #endif
 }
 
+// A forwarder started us with --appid=<xCloud id>: skip the library and go
+// straight into that game. The cached library may predate the title, so a miss
+// reloads it once from the server before giving up.
+void start_direct_launch(App& app) {
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(app.games.size()); ++i) {
+        if (strcasecmp(app.games[i].title_id.c_str(),
+                       app.direct_title.c_str()) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0 && !app.direct_refreshed) {
+        app.direct_refreshed = true;
+        app.scene = Scene::LoadingLibrary;
+        start_library_load(app, true);
+        return;
+    }
+    std::string title = std::move(app.direct_title);
+    app.direct_title.clear();
+    if (index < 0 || !app.games[index].playable()) {
+        app.fatal = index < 0 ? "Unknown xCloud title: " + title
+                              : "Your account cannot stream " + title;
+        log_fatal(app.fatal);
+        app.scene = Scene::Fatal;
+        return;
+    }
+    app.direct_launch = true;
+    app.launch_game = app.games[index];
+    push_history(app, app.launch_game.title_id);
+    launch_stream(app, false);
+}
+
 void draw_fatal(App& app) {
     SDL_Rect card = {410, 180, 1100,
                      app.fatal.find("streaming login") != std::string::npos
@@ -2465,8 +2502,11 @@ Input poll_input(SDL_Joystick*& joystick) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    std::string direct_title;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg.rfind("--appid=", 0) == 0) direct_title = arg.substr(8);
+    }
 
 #ifdef __SWITCH__
     // The default UDP receive buffer is ~42 KB, too small to absorb a 1080p
@@ -2496,6 +2536,7 @@ int main(int argc, char** argv) {
     mkdir(kDataDir, 0755);
 
     App app;
+    app.direct_title = std::move(direct_title);
     if (!app.gfx.init()) return 1;
     app.ui_sound.init();  // menu navigation ticks (best-effort; ignored on fail)
     SDL_Joystick* joystick = SDL_JoystickOpen(0);
@@ -2628,6 +2669,10 @@ int main(int argc, char** argv) {
                         app.tab = LibraryTab::Consoles;
                     apply_filter(app);
                     app.scene = Scene::Library;
+                    if (!app.direct_title.empty()) {
+                        start_direct_launch(app);
+                        break;
+                    }
                     try {
                         app.gamertag = app.auth->fetch_profile().gamertag;
                         remember_gamertag(app.gamertag);
@@ -2641,6 +2686,12 @@ int main(int argc, char** argv) {
                 break;
 
             case Scene::Library: {
+                // A direct launch never shows the library: every way out of
+                // the stream lands here, after deko3d has been handed back.
+                if (app.direct_launch) {
+                    running = false;
+                    break;
+                }
                 int tabs = app.consoles.empty() ? 3 : kTabCount;
                 bool console_tab = app.tab == LibraryTab::Consoles;
 
