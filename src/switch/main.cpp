@@ -39,6 +39,15 @@
 #include "stream/engine.hpp"
 #endif
 
+#ifdef __SWITCH__
+__asm__(
+    ".pushsection .rodata\n"
+    "gnx_logo_png:\n .incbin \"xbox_logo.png\"\n"
+    "gnx_logo_png_end:\n"
+    ".popsection\n");
+extern "C" const unsigned char gnx_logo_png[], gnx_logo_png_end[];
+#endif
+
 using nlohmann::json;
 using namespace gnx;
 
@@ -360,6 +369,7 @@ struct App {
     UiSound ui_sound;
     std::unique_ptr<Covers> covers;
     std::unique_ptr<Names> names;  // lazy name lookup for catalog search hits
+    SDL_Texture* logo = nullptr;   // dies with the renderer, reloaded lazily
     std::unique_ptr<XboxAuth> auth;
 
     Scene scene = Scene::Splash;
@@ -989,14 +999,27 @@ void draw_focus_frames(App& app, const SDL_Rect& r) {
                   {gfx::kFocus.r, gfx::kFocus.g, gfx::kFocus.b, 38}, 8);
 }
 
-// Header: 44x44 accent square with "nx" + wordmark, top-left inside margins.
+// The Xbox sphere on an accent square.
+void draw_logo(App& app, const SDL_Rect& rect) {
+    app.gfx.fill(rect, gfx::kAccent);
+#ifdef __SWITCH__
+    if (!app.logo)
+        app.logo = app.gfx.texture_from_memory(
+            gnx_logo_png, gnx_logo_png_end - gnx_logo_png);
+#endif
+    int inset = rect.w / 7;
+    if (app.logo)
+        app.gfx.draw_texture(app.logo,
+                             {rect.x + inset, rect.y + inset,
+                              rect.w - 2 * inset, rect.h - 2 * inset});
+}
+
+// Header: 44x44 logo + wordmark, top-left inside margins.
 void draw_header(App& app) {
     SDL_Rect logo = {kMargin, 48, 44, 44};
-    app.gfx.fill(logo, gfx::kAccent);
-    app.gfx.text_centered("nx", logo.x + 22, logo.y + 6, gfx::FontSize::Small,
-                          gfx::kText);
-    app.gfx.text("green-nx", logo.x + 64, logo.y + 4, gfx::FontSize::Note,
-                 gfx::kText);
+    draw_logo(app, logo);
+    app.gfx.text("Xbox Cloud Streaming", logo.x + 64, logo.y + 4,
+                 gfx::FontSize::Note, gfx::kText);
 }
 
 // Fallback cover: per-title dark hue + big translucent initials, so a grid
@@ -1036,19 +1059,19 @@ void draw_cover_fallback(App& app, const Game& game, const SDL_Rect& rect,
 void draw_splash(App& app) {
     Uint32 elapsed = SDL_GetTicks() - app.scene_started;
     int logo_w = static_cast<int>(120 * std::min(elapsed / 300.0f, 1.0f));
-    int word_w = app.gfx.text_width("green-nx", gfx::FontSize::Huge);
+    const char* word = "Xbox Cloud Streaming";
+    int word_w = app.gfx.text_width(word, gfx::FontSize::Huge);
     int row_w = 120 + 36 + word_w;
     int x0 = (gfx::kWidth - row_w) / 2;
     if (logo_w > 0) {
-        app.gfx.fill({x0, 400, logo_w, 120}, gfx::kAccent);
         if (logo_w == 120)
-            app.gfx.text_centered("nx", x0 + 60, 428, gfx::FontSize::Title,
-                                  gfx::kText);
+            draw_logo(app, {x0, 400, 120, 120});
+        else
+            app.gfx.fill({x0, 400, logo_w, 120}, gfx::kAccent);
     }
     if (elapsed > 300) {
-        app.gfx.text("green-nx", x0 + 156, 408, gfx::FontSize::Huge,
-                     gfx::kText);
-        app.gfx.text_centered("Xbox Cloud Gaming for Nintendo Switch",
+        app.gfx.text(word, x0 + 156, 408, gfx::FontSize::Huge, gfx::kText);
+        app.gfx.text_centered("for Nintendo Switch",
                               gfx::kWidth / 2, 548, gfx::FontSize::Note,
                               gfx::kTextDim);
     }
@@ -3188,6 +3211,7 @@ int main(int argc, char** argv) {
             app.engine->state() == stream::EngineState::Streaming;
         if (want_deko && !app.deko_active) {
             app.covers->drop_textures();  // textures die with the renderer
+            app.logo = nullptr;
             app.gfx.suspend();
             if (app.engine->begin_deko_output()) {
                 app.deko_active = true;
