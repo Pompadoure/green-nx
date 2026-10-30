@@ -18,6 +18,11 @@
 #include <memory>
 #include <vector>
 
+// SDL_image's IMG_SaveJPG crashes on the console, in libjpeg's error path.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 #define R_TRY(expr)                    \
     do {                               \
         const Result rc_ = (expr);     \
@@ -1367,16 +1372,13 @@ bool make_icon(const std::string& image, std::vector<u8>& out) {
     SDL_Rect dst = {0, 0, kIconSize, kIconSize};
     if (SDL_BlitScaled(src, &crop, icon, &dst) != 0) return false;
 
-    constexpr const char* kTemp = "sdmc:/switch/green-nx/icon-tmp.jpg";
-    if (IMG_SaveJPG(icon, kTemp, 90) != 0) return false;
-    ON_SCOPE_EXIT(std::remove(kTemp));
-    FILE* f = std::fopen(kTemp, "rb");
-    if (!f) return false;
-    ON_SCOPE_EXIT(std::fclose(f));
-    std::fseek(f, 0, SEEK_END);
-    out.resize(std::ftell(f));
-    std::fseek(f, 0, SEEK_SET);
-    return !out.empty() && std::fread(out.data(), out.size(), 1, f) == 1;
+    const auto append = [](void* context, void* data, int size) {
+        auto* bytes = static_cast<std::vector<u8>*>(context);
+        auto* first = static_cast<const u8*>(data);
+        bytes->insert(bytes->end(), first, first + size);
+    };
+    return stbi_write_jpg_to_func(append, &out, kIconSize, kIconSize, 3,
+                                  icon->pixels, 90) != 0;
 }
 
 Result install_title(const std::string& title_id, const std::string& name,
