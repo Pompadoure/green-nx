@@ -5,7 +5,7 @@ name: build
 
 on:
   push:
-    branches: [main, direct-launch]
+    branches: [main, direct-launch, home-screen]
   pull_request:
 
 jobs:

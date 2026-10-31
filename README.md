@@ -52,6 +52,13 @@ involved.
 | Settings | Stream quality (720p / 1080p / 1080p HQ) · button layout (positional / labels) |
 | In stream | Xbox controls mapped from the Switch pad · hold **-** + **+** to quit |
 
+### Home
+
+The first tab is laid out like xbox.com/play: Jump back in, Favorites, Recently
+added, Most popular, Leaving soon and Genres. The three Game Pass rows come from
+`catalog.gamepass.com`, show only what your account can play, and are cached.
+If they can't be fetched the rows are hidden; `home-log.txt` says why.
+
 ### Home screen shortcuts
 
 On a game's page, **Add to home screen** installs a shortcut with the game's

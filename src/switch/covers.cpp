@@ -9,6 +9,14 @@
 
 namespace gnx {
 
+namespace {
+
+// Roughly a dozen rows' worth of Home plus the grid: enough that scrolling
+// back is instant, while keeping VRAM bounded across a 589-title library.
+constexpr size_t kMaxTextures = 220;
+
+}  // namespace
+
 Covers::Covers(gfx::Gfx& gfx, std::string cache_dir)
     : gfx_(gfx), cache_dir_(std::move(cache_dir)) {
     mkdir(cache_dir_.c_str(), 0755);
@@ -29,7 +37,10 @@ Covers::~Covers() {
 
 SDL_Texture* Covers::get(const std::string& title_id, const std::string& url) {
     auto found = textures_.find(title_id);
-    if (found != textures_.end()) return found->second;
+    if (found != textures_.end()) {
+        last_used_[title_id] = SDL_GetTicks();
+        return found->second;
+    }
     if (url.empty()) return nullptr;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -52,6 +63,23 @@ void Covers::pump() {
         }
         // Negative results are cached as nullptr so we don't retry every frame.
         textures_[done.title_id] = gfx_.texture_from_surface(done.surface);
+        last_used_[done.title_id] = SDL_GetTicks();
+    }
+
+    while (textures_.size() > kMaxTextures) {
+        auto oldest = last_used_.begin();
+        for (auto it = last_used_.begin(); it != last_used_.end(); ++it)
+            if (it->second < oldest->second) oldest = it;
+        auto texture = textures_.find(oldest->first);
+        if (texture != textures_.end()) {
+            if (texture->second) SDL_DestroyTexture(texture->second);
+            textures_.erase(texture);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_.erase(oldest->first);  // reloadable from the SD card
+        }
+        last_used_.erase(oldest);
     }
 }
 
@@ -59,6 +87,7 @@ void Covers::drop_textures() {
     for (auto& [key, texture] : textures_)
         if (texture) SDL_DestroyTexture(texture);
     textures_.clear();
+    last_used_.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.clear();  // allow re-queue after the renderer is rebuilt
     for (Done& done : done_)

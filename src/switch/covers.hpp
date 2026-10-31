@@ -45,6 +45,7 @@ private:
     std::string cache_dir_;
 
     std::unordered_map<std::string, SDL_Texture*> textures_;
+    std::unordered_map<std::string, Uint32> last_used_;
     std::unordered_set<std::string> pending_;
 
     struct Job {

@@ -18,11 +18,14 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -218,8 +221,34 @@ enum class Scene {
     Accounts, Stream, Fatal
 };
 
-enum class LibraryTab { All, Favorites, History, Consoles };
-constexpr int kTabCount = 4;  // Consoles only shows with a linked console
+enum class LibraryTab { Home, All, Favorites, History, Consoles };
+constexpr int kTabCount = 5;  // Consoles only shows with a linked console
+
+// One horizontal row of the Home tab.
+enum class HomeKind { Hero, Games, Tiles };
+struct HomeRow {
+    std::string title;
+    HomeKind kind = HomeKind::Games;
+    std::vector<int> games;           // indices into games (Hero, Games)
+    std::vector<std::string> tiles;   // labels (Tiles)
+    int column = 0;
+    float scroll = 0;                 // eased horizontal offset, pixels
+    int size() const {
+        return static_cast<int>(kind == HomeKind::Tiles ? tiles.size()
+                                                        : games.size());
+    }
+};
+
+// Product ids of the Game Pass rows on Home, with the time they were fetched.
+struct HomeLists {
+    std::vector<std::string> recent, popular, leaving;
+    long long fetched = 0;
+};
+
+struct HomeHit {  // an on-screen Home card, for touch
+    SDL_Rect rect;
+    int row, column;
+};
 constexpr int kHistoryMax = 10;  // recently-played games kept
 
 #ifdef __SWITCH__
@@ -394,7 +423,17 @@ struct App {
     int playable_visible = 0;  // of those, how many can actually be launched
     std::string query;
     int cursor = 0;
-    LibraryTab tab = LibraryTab::All;
+    LibraryTab tab = LibraryTab::Home;
+    std::string genre;  // All games filter, set from a Home genre tile
+    std::vector<HomeRow> home_rows;
+    int home_row = 0;          // focused row
+    float home_scroll = 0;     // eased vertical offset, pixels
+    bool home_dirty = true;    // rows must be rebuilt
+    std::vector<HomeHit> home_hits;
+    HomeLists home_lists;
+    HomeLists home_fetched;    // written by home_thread, read at state 1
+    std::atomic<int> home_fetch_state{0};  // 0 idle, 1 result is ready
+    std::thread home_thread;
     std::vector<std::string> favorites;  // title_ids, marked by the user
     std::vector<std::string> history;    // title_ids, most-recent first
     std::atomic<int> load_state{0};  // 0 running, 1 ok, 2 error
@@ -528,7 +567,7 @@ void apply_region(const Settings& settings) {
 // flags, v3 predates the ad-supported offering: all force a refresh. The
 // cache is the whole catalog (~2400 entries, ~300 KB), which is what search
 // needs to answer "is this game on xCloud?" without going back to the network.
-constexpr int kGamesCacheVersion = 4;
+constexpr int kGamesCacheVersion = 5;  // v5 added Home art and genres
 
 void save_games_cache(const std::vector<Game>& games) {
     json list = json::array();
@@ -538,6 +577,8 @@ void save_games_cache(const std::vector<Game>& games) {
                         {"name", game.name},
                         {"boxArt", game.box_art_url},
                         {"icon", game.icon_url},
+                        {"hero", game.hero_url},
+                        {"genres", game.genres},
                         {"owned", game.owned},
                         {"sub", game.subscription},
                         {"mySub", game.in_subscription},
@@ -564,6 +605,9 @@ std::vector<Game> load_games_cache() {
         game.name = entry.value("name", "");
         game.box_art_url = entry.value("boxArt", "");
         game.icon_url = entry.value("icon", "");
+        game.hero_url = entry.value("hero", "");
+        game.genres =
+            entry.value("genres", std::vector<std::string>{});
         game.owned = entry.value("owned", false);
         game.subscription = entry.value("sub", false);
         game.in_subscription = entry.value("mySub", false);
@@ -574,6 +618,30 @@ std::vector<Game> load_games_cache() {
         if (!game.title_id.empty()) games.push_back(std::move(game));
     }
     return games;
+}
+
+// Game Pass lists for Home. Shared by all accounts: they are the catalog's,
+// not the account's, and the rows filter them down to what it can play.
+HomeLists load_home_lists() {
+    HomeLists lists;
+    std::ifstream in(data_path("home-lists.json"));
+    if (!in) return lists;
+    json data = json::parse(in, nullptr, false);
+    if (data.is_discarded() || !data.is_object()) return lists;
+    lists.recent = data.value("recent", std::vector<std::string>{});
+    lists.popular = data.value("popular", std::vector<std::string>{});
+    lists.leaving = data.value("leaving", std::vector<std::string>{});
+    lists.fetched = data.value("fetched", 0LL);
+    return lists;
+}
+
+void save_home_lists(const HomeLists& lists) {
+    std::ofstream out(data_path("home-lists.json"), std::ios::trunc);
+    out << json{{"recent", lists.recent},
+                {"popular", lists.popular},
+                {"leaving", lists.leaving},
+                {"fetched", lists.fetched}}
+               .dump();
 }
 
 // Linked consoles are cached like the games list, so the source picker is
@@ -635,6 +703,7 @@ void toggle_favorite(App& app, const std::string& id) {
     else
         app.favorites.push_back(id);
     save_id_list("favorites.json", app.favorites);
+    app.home_dirty = true;
 }
 
 // Record a launch: move the title to the front, dedup, cap at kHistoryMax.
@@ -645,6 +714,7 @@ void push_history(App& app, const std::string& id) {
     if (static_cast<int>(app.history.size()) > kHistoryMax)
         app.history.resize(kHistoryMax);
     save_id_list("history.json", app.history);
+    app.home_dirty = true;
 }
 
 // ---- background work ------------------------------------------------------
@@ -861,7 +931,10 @@ void switch_account(App& app, const std::string& id) {
     app.history = load_id_list("history.json");
     app.gamertag.clear();
     app.cursor = app.console_cursor = 0;
-    app.tab = LibraryTab::All;
+    app.tab = LibraryTab::Home;
+    app.genre.clear();
+    app.home_row = 0;
+    app.home_dirty = true;
     app.query.clear();
     if (app.auth->has_saved_login()) {
         g_signin_return_account.clear();
@@ -918,6 +991,10 @@ void apply_filter(App& app) {
             if (!game.playable() && needle.empty() &&
                 app.tab != LibraryTab::Favorites)
                 continue;
+            if (app.tab == LibraryTab::All && !app.genre.empty() &&
+                std::find(game.genres.begin(), game.genres.end(), app.genre) ==
+                    game.genres.end())
+                continue;
             if (app.tab == LibraryTab::Favorites &&
                 !is_favorite(app, game.title_id))
                 continue;
@@ -929,6 +1006,122 @@ void apply_filter(App& app) {
     app.playable_visible = 0;
     for (int i : app.visible)
         if (app.games[i].playable()) ++app.playable_visible;
+}
+
+// Lay out the Home tab from the library, the account's history and favorites,
+// and the Game Pass lists. Rows with nothing to show are left out.
+void build_home(App& app) {
+    app.home_dirty = false;
+    std::map<std::string, int> columns;
+    for (const HomeRow& row : app.home_rows) columns[row.title] = row.column;
+
+    auto fold = [](std::string id) {
+        for (char& c : id)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return id;
+    };
+    std::unordered_map<std::string, int> by_product;
+    std::map<std::string, int> genre_counts;
+    for (int i = 0; i < static_cast<int>(app.games.size()); ++i) {
+        const Game& game = app.games[i];
+        if (!game.playable()) continue;
+        by_product[fold(game.product_id)] = i;
+        for (const std::string& genre : game.genres) ++genre_counts[genre];
+    }
+
+    std::vector<HomeRow> rows;
+    auto add_row = [&](const char* title, HomeKind kind, std::vector<int> games) {
+        if (games.empty()) return;
+        HomeRow row;
+        row.title = title;
+        row.kind = kind;
+        row.games = std::move(games);
+        rows.push_back(std::move(row));
+    };
+    auto by_title_ids = [&](const std::vector<std::string>& ids) {
+        std::vector<int> games;
+        for (const std::string& id : ids) {
+            int i = find_game(app, id);
+            if (i >= 0 && app.games[i].playable()) games.push_back(i);
+        }
+        return games;
+    };
+    auto by_product_ids = [&](const std::vector<std::string>& ids) {
+        std::vector<int> games;
+        for (const std::string& id : ids) {
+            auto found = by_product.find(fold(id));
+            if (found != by_product.end()) games.push_back(found->second);
+        }
+        return games;
+    };
+
+    add_row("Jump back in", HomeKind::Hero, by_title_ids(app.history));
+    add_row("Favorites", HomeKind::Games, by_title_ids(app.favorites));
+    add_row("Recently added", HomeKind::Games,
+            by_product_ids(app.home_lists.recent));
+    add_row("Most popular", HomeKind::Games,
+            by_product_ids(app.home_lists.popular));
+    add_row("Leaving soon", HomeKind::Games,
+            by_product_ids(app.home_lists.leaving));
+
+    // Largest genres first; "Other" says nothing, so it is left out.
+    std::vector<std::pair<std::string, int>> genres(genre_counts.begin(),
+                                                    genre_counts.end());
+    std::stable_sort(genres.begin(), genres.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.second > b.second;
+                     });
+    HomeRow tiles;
+    tiles.title = "Genres";
+    tiles.kind = HomeKind::Tiles;
+    tiles.tiles.push_back("All games");
+    for (const auto& [genre, count] : genres)
+        if (genre != "Other") tiles.tiles.push_back(genre);
+    rows.push_back(std::move(tiles));
+
+    for (HomeRow& row : rows) {
+        auto found = columns.find(row.title);
+        if (found != columns.end())
+            row.column = std::min(found->second, row.size() - 1);
+    }
+    app.home_rows = std::move(rows);
+    app.home_row = std::clamp(app.home_row, 0,
+                              static_cast<int>(app.home_rows.size()) - 1);
+}
+
+// Refresh the Game Pass lists in the background. Home draws from the cache
+// meanwhile, and a failure only costs those rows; home-log.txt says why, since
+// nothing on screen can.
+void start_home_lists(App& app) {
+    constexpr long long kMaxAgeSeconds = 6 * 60 * 60;
+    const long long now = static_cast<long long>(std::time(nullptr));
+    const long long age = now - app.home_lists.fetched;
+    if (app.home_thread.joinable() || (age >= 0 && age < kMaxAgeSeconds)) return;
+    app.home_thread = std::thread([&app, now] {
+        HomeLists lists;
+        std::string log = "ok";
+        try {
+            Http http;
+            http.set_abort_flag(&app.abort_http);
+            lists.recent = fetch_game_list(
+                http, "f13cf6b4-57e6-4459-89df-6aec18cf0538");
+            lists.popular = fetch_game_list(
+                http, "eab7757c-ff70-45af-bfa6-79d3cfb2bf81");
+            lists.leaving = fetch_game_list(
+                http, "393f05bf-e596-4ef6-9487-6d4fa0eab987");
+            lists.fetched = now;
+            save_home_lists(lists);
+        } catch (const std::exception& error) {
+            lists = HomeLists{};
+            log = std::string("lists failed: ") + error.what();
+        }
+        if (FILE* f = std::fopen(data_path("home-log.txt").c_str(), "w")) {
+            std::fprintf(f, "%s\n", log.c_str());
+            std::fclose(f);
+        }
+        app.home_fetched = std::move(lists);
+        app.home_fetch_state = 1;
+    });
 }
 
 std::string keyboard_input(const std::string& initial) {
@@ -1208,8 +1401,8 @@ constexpr int kGridX = 170;
 constexpr int kGridY = 220;
 constexpr int kRowsVisible = 2;
 
-const char* kTabNames[kTabCount] = {"All games", "Favorites", "History",
-                                    "Consoles"};
+const char* kTabNames[kTabCount] = {"Home", "All games", "Favorites",
+                                    "History", "Consoles"};
 
 const char* kQualityLabels[3] = {"720p", "1080p", "1080p high bitrate"};
 const char* kMappingLabels[2] = {"Positional (Switch A = Xbox B)",
@@ -1388,6 +1581,148 @@ void draw_empty_state(App& app, const std::string& glyph, gfx::Color glyph_col,
     app.gfx.text(post, x, 616, gfx::FontSize::Note, gfx::kTextDim);
 }
 
+// ---- Home tab -------------------------------------------------------------
+constexpr int kHomeTop = 206;      // first row, below the tabs
+constexpr int kHomeHeading = 56;   // row title above the cards
+constexpr int kHeroW = 640;
+constexpr int kHeroH = 360;
+constexpr int kTileW = 340;
+constexpr int kTileH = 110;
+
+int home_card_step(HomeKind kind) {
+    return (kind == HomeKind::Hero    ? kHeroW
+            : kind == HomeKind::Tiles ? kTileW
+                                      : kCardW) +
+           kGapX;
+}
+
+int home_row_height(HomeKind kind) {
+    return kHomeHeading + (kind == HomeKind::Hero    ? kHeroH + kGapY
+                           : kind == HomeKind::Tiles ? kTileH + kGapX
+                                                     : kCardH + kGapY);
+}
+
+float ease_towards(float value, float target) {
+    float next = value + (target - value) * 0.28f;
+    return std::fabs(target - next) < 1.0f ? target : next;
+}
+
+std::string home_hero_key(const Game& game) { return game.title_id + "_hero"; }
+
+void draw_hero_card(App& app, const Game& game, const SDL_Rect& card,
+                    bool focused) {
+    if (game.name.empty()) app.names->request(game);
+    SDL_Texture* art = app.covers->get(home_hero_key(game), game.hero_url);
+    if (art)
+        app.gfx.draw_texture(art, card);
+    else
+        draw_cover_fallback(app, game, card, gfx::FontSize::Huge);
+    if (focused) {
+        draw_focus_frames(app, card);
+        SDL_Rect plate = {card.x, card.y + kHeroH + 14, kHeroW, 44};
+        app.gfx.fill(plate, gfx::kSurface);
+        const std::string& label =
+            game.name.empty() ? game.title_id : game.name;
+        app.gfx.text_centered(label.substr(0, 40), plate.x + plate.w / 2,
+                              plate.y + 8, gfx::FontSize::Small, gfx::kText);
+    }
+}
+
+// Ask for art just outside the view, ahead of the cards on screen: the cover
+// queue serves the newest request first.
+void prefetch_home_row(App& app, const HomeRow& row) {
+    for (int i = std::min(row.size(), row.column + 8) - 1;
+         i >= std::max(0, row.column - 2); --i) {
+        if (row.kind == HomeKind::Tiles) break;
+        const Game& game = app.games[row.games[i]];
+        if (row.kind == HomeKind::Hero)
+            app.covers->get(home_hero_key(game), game.hero_url);
+        else
+            app.covers->get(game.title_id, game.box_art_url);
+    }
+}
+
+void draw_home(App& app) {
+    app.home_hits.clear();
+    const int row_count = static_cast<int>(app.home_rows.size());
+    int target = 0;
+    for (int r = 0; r < app.home_row; ++r)
+        target += home_row_height(app.home_rows[r].kind);
+    app.home_scroll = ease_towards(app.home_scroll, static_cast<float>(target));
+
+    for (int r = std::min(row_count, app.home_row + 3) - 1;
+         r >= std::max(0, app.home_row - 1); --r)
+        prefetch_home_row(app, app.home_rows[r]);
+
+    SDL_Rect view = {0, kHomeTop - 16, gfx::kWidth,
+                     kFooterY - (kHomeTop - 16)};
+    SDL_RenderSetClipRect(app.gfx.renderer(), &view);
+    int y = kHomeTop - static_cast<int>(app.home_scroll);
+    for (int r = 0; r < row_count; ++r) {
+        HomeRow& row = app.home_rows[r];
+        const int height = home_row_height(row.kind);
+        const int top = y;
+        y += height;
+
+        // Keep the focused card second from the left, without leaving a gap
+        // after the last one.
+        const int step = home_card_step(row.kind);
+        const int room = gfx::kWidth - kGridX - kMargin;
+        const int max_scroll = std::max(0, row.size() * step - kGapX - room);
+        const int wanted =
+            std::clamp((row.column - 1) * step, 0, max_scroll);
+        row.scroll = ease_towards(row.scroll, static_cast<float>(wanted));
+
+        if (top + height < view.y || top > kFooterY) continue;
+        const bool active = r == app.home_row;
+        app.gfx.text(row.title, kGridX, top, gfx::FontSize::Body,
+                     active ? gfx::kText : gfx::kTextDim);
+
+        const int card_y = top + kHomeHeading;
+        const int offset = kGridX - static_cast<int>(row.scroll);
+        auto card_rect = [&](int i) {
+            SDL_Rect card = {offset + i * step, card_y, step - kGapX,
+                             row.kind == HomeKind::Hero    ? kHeroH
+                             : row.kind == HomeKind::Tiles ? kTileH
+                                                           : kCardH};
+            return card;
+        };
+        auto draw_item = [&](int i, const SDL_Rect& card, bool focused) {
+            if (row.kind == HomeKind::Tiles) {
+                app.gfx.fill(card, focused ? gfx::kSurfaceHi : gfx::kSurface);
+                app.gfx.fill({card.x, card.y, 8, card.h}, gfx::kAccent);
+                app.gfx.text_centered(row.tiles[i], card.x + card.w / 2,
+                                      card.y + 34, gfx::FontSize::Small,
+                                      gfx::kText);
+                if (focused) draw_focus_frames(app, card);
+            } else if (row.kind == HomeKind::Hero) {
+                draw_hero_card(app, app.games[row.games[i]], card, focused);
+            } else {
+                draw_card(app, app.games[row.games[i]], card, focused);
+            }
+        };
+
+        const int first = std::max(0, static_cast<int>(row.scroll) / step - 1);
+        for (int i = first; i < row.size(); ++i) {
+            SDL_Rect card = card_rect(i);
+            if (card.x > gfx::kWidth) break;
+            app.home_hits.push_back({card, r, i});
+            if (!(active && i == row.column)) draw_item(i, card, false);
+        }
+        // Last, so its scale and glow overlap the neighbours.
+        if (active && row.size() > 0)
+            draw_item(row.column, card_rect(row.column), true);
+    }
+    SDL_RenderSetClipRect(app.gfx.renderer(), nullptr);
+
+    draw_hints(app, {{"A", "Open", true},
+                     {"X", "Favorite"},
+                     {"Y", "Search"},
+                     {"ZR", "Refresh"},
+                     {"ZL", "Settings"},
+                     {"+", "Exit"}});
+}
+
 void draw_library(App& app) {
     // Row 1: identity (logo left, gamertag + source chip right). The source
     // chip only exists when a console is linked (card 1e visibility rule).
@@ -1449,7 +1784,7 @@ void draw_library(App& app) {
     int tx = kGridX;
     draw_chip(app, "L", tx, 128, false);
     tx += chip_width(app, "L") + 44;
-    int tabs = app.consoles.empty() ? 3 : kTabCount;
+    int tabs = app.consoles.empty() ? kTabCount - 1 : kTabCount;
     for (int t = 0; t < tabs; ++t) {
         bool active = static_cast<int>(app.tab) == t;
         int w = app.gfx.text(kTabNames[t], tx, 124, gfx::FontSize::Body,
@@ -1458,6 +1793,11 @@ void draw_library(App& app) {
         tx += w + 44;
     }
     draw_chip(app, "R", tx, 128, false);
+
+    if (app.tab == LibraryTab::Home) {
+        draw_home(app);
+        return;
+    }
 
     if (app.tab == LibraryTab::Consoles) {
         std::string info =
@@ -1477,6 +1817,7 @@ void draw_library(App& app) {
     }
 
     std::string info = std::to_string(app.visible.size()) + " games";
+    if (!app.genre.empty()) info = app.genre + "  ·  " + info;
     if (!app.query.empty()) {
         // With a query the count mixes the library with the wider catalog;
         // spell the split out instead of implying they are all playable.
@@ -2672,6 +3013,7 @@ int main(int argc, char** argv) {
     app.settings = load_settings();
     app.favorites = load_id_list("favorites.json");
     app.history = load_id_list("history.json");
+    app.home_lists = load_home_lists();
     {
         // Surface the previous run's last exit breadcrumb in Settings, so the
         // black-screen-on-exit bug can be diagnosed without pulling the SD.
@@ -2805,6 +3147,8 @@ int main(int argc, char** argv) {
                         start_direct_launch(app);
                         break;
                     }
+                    app.home_dirty = true;
+                    start_home_lists(app);
                     try {
                         app.gamertag = app.auth->fetch_profile().gamertag;
                         remember_gamertag(app.gamertag);
@@ -2824,8 +3168,20 @@ int main(int argc, char** argv) {
                     running = false;
                     break;
                 }
-                int tabs = app.consoles.empty() ? 3 : kTabCount;
+                if (app.home_fetch_state == 1) {
+                    app.home_thread.join();
+                    app.home_fetch_state = 0;
+                    if (app.home_fetched.fetched != 0) {
+                        app.home_lists = std::move(app.home_fetched);
+                        app.home_dirty = true;
+                    }
+                }
+                if (app.home_dirty) build_home(app);
+                if (app.tab != LibraryTab::All) app.genre.clear();
+
+                int tabs = app.consoles.empty() ? kTabCount - 1 : kTabCount;
                 bool console_tab = app.tab == LibraryTab::Consoles;
+                bool home_tab = app.tab == LibraryTab::Home;
 
                 // Touch: tap a tab to switch, or a card to select + open it,
                 // reusing the A path (input.a) below. Design-space coords.
@@ -2843,6 +3199,20 @@ int main(int argc, char** argv) {
                                 break;
                             }
                             tx += w + 44;
+                        }
+                    } else if (home_tab) {
+                        for (const HomeHit& hit : app.home_hits) {
+                            if (input.touch_x >= hit.rect.x &&
+                                input.touch_x < hit.rect.x + hit.rect.w &&
+                                input.touch_y >= hit.rect.y &&
+                                input.touch_y < hit.rect.y + hit.rect.h &&
+                                input.touch_y >= kHomeTop &&
+                                input.touch_y < kFooterY) {
+                                app.home_row = hit.row;
+                                app.home_rows[hit.row].column = hit.column;
+                                input.a = true;
+                                break;
+                            }
                         }
                     } else if (console_tab) {
                         int cx = input.touch_x - kGridX;
@@ -2887,7 +3257,52 @@ int main(int argc, char** argv) {
                     break;
                 }
 
-                if (console_tab) {
+                if (input.b && !app.genre.empty()) {  // back out of a genre
+                    app.genre.clear();
+                    app.tab = LibraryTab::Home;
+                    app.cursor = 0;
+                    apply_filter(app);
+                    break;
+                }
+
+                if (home_tab) {
+                    const int last_row =
+                        static_cast<int>(app.home_rows.size()) - 1;
+                    if (input.up) --app.home_row;
+                    if (input.down) ++app.home_row;
+                    app.home_row = std::clamp(app.home_row + input.swipe_rows,
+                                              0, last_row);
+                    HomeRow& row = app.home_rows[app.home_row];
+                    if (input.left) --row.column;
+                    if (input.right) ++row.column;
+                    row.column = std::clamp(row.column, 0, row.size() - 1);
+
+                    const bool tiles = row.kind == HomeKind::Tiles;
+                    if (input.a && tiles) {
+                        // The first tile is the unfiltered list.
+                        app.genre =
+                            row.column == 0 ? "" : row.tiles[row.column];
+                        app.tab = LibraryTab::All;
+                        app.cursor = 0;
+                        apply_filter(app);
+                        break;
+                    }
+                    if (!tiles) {
+                        // The A path below opens the game at the cursor.
+                        app.visible = {row.games[row.column]};
+                        app.cursor = 0;
+                    }
+                    if (input.x && !tiles) {
+                        toggle_favorite(app, app.games[row.games[row.column]]
+                                                 .title_id);
+                    }
+                    if (input.y) {
+                        app.query = keyboard_input(app.query);
+                        app.tab = LibraryTab::All;
+                        app.cursor = 0;
+                        apply_filter(app);
+                    }
+                } else if (console_tab) {
                     int last = static_cast<int>(app.consoles.size()) - 1;
                     if (input.left)
                         app.console_cursor =
@@ -3363,6 +3778,7 @@ int main(int argc, char** argv) {
     if (app.signin_state == 0) app.signin_state = 4;
     app.abort_http = true;  // unblock any in-flight worker HTTP call
     join_worker(app);
+    if (app.home_thread.joinable()) app.home_thread.join();
     breadcrumb("workers joined");
 
 #ifdef GNX_NATIVE_STREAM

@@ -231,13 +231,29 @@ void fetch_names(Http& http, const std::vector<Game*>& games,
             const json& properties = localized.front();
             found->second->name = properties.value("ProductTitle", "");
 
-            std::string poster, box_art;
+            auto store = product.find("Properties");
+            if (store != product.end() && store->is_object()) {
+                auto categories = store->find("Categories");
+                if (categories != store->end() && categories->is_array())
+                    for (const json& category : *categories)
+                        if (category.is_string())
+                            found->second->genres.push_back(
+                                category.get<std::string>());
+            }
+
+            std::string poster, box_art, hero, titled_hero;
             for (const json& image :
                  properties.value("Images", json::array())) {
                 std::string purpose = image.value("ImagePurpose", "");
                 if (purpose == "Poster") poster = image.value("Uri", "");
                 else if (purpose == "BoxArt") box_art = image.value("Uri", "");
+                else if (purpose == "SuperHeroArt") hero = image.value("Uri", "");
+                else if (purpose == "TitledHeroArt")
+                    titled_hero = image.value("Uri", "");
             }
+            const std::string& wide = !titled_hero.empty() ? titled_hero : hero;
+            if (!wide.empty())
+                found->second->hero_url = "https:" + wide + "?w=640&h=360";
             const std::string& uri = !poster.empty() ? poster : box_art;
             if (!uri.empty())
                 found->second->box_art_url = "https:" + uri + "?h=300";
@@ -245,6 +261,25 @@ void fetch_names(Http& http, const std::vector<Game*>& games,
                 found->second->icon_url = "https:" + box_art + "?w=256&h=256";
         }
     }
+}
+
+std::vector<std::string> fetch_game_list(Http& http, const std::string& list_id,
+                                         const std::string& market) {
+    HttpResponse response =
+        http.get("https://catalog.gamepass.com/sigls/v2?id=" + list_id +
+                 "&language=en-us&market=" + market);
+    if (!response.ok())
+        throw std::runtime_error("list request failed with HTTP " +
+                                 std::to_string(response.status));
+    json parsed = json::parse(response.body, nullptr, false);
+    std::vector<std::string> ids;
+    if (!parsed.is_array()) return ids;
+    for (const json& entry : parsed) {
+        if (!entry.is_object()) continue;  // the first entry is the list header
+        std::string id = entry.value("id", "");
+        if (!id.empty()) ids.push_back(std::move(id));
+    }
+    return ids;
 }
 
 }  // namespace gnx

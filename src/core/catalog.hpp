@@ -14,6 +14,8 @@ struct Game {
     std::string name;        // filled by fetch_names()
     std::string box_art_url;
     std::string icon_url;    // square art for a home screen shortcut
+    std::string hero_url;    // wide art for the large Home cards
+    std::vector<std::string> genres;  // store categories
 
     // How this account can reach the title. Several can be true at once: a
     // game you own is usually in the subscription catalog as well.
@@ -76,6 +78,11 @@ void fetch_names(Http& http, const std::vector<Game*>& games,
 void fetch_names(Http& http, std::vector<Game>& games,
                  const std::string& market = "US",
                  const std::string& language = "en-US");
+
+// Product ids of a Game Pass catalog list, in the list's own order. Throws on
+// a failed request.
+std::vector<std::string> fetch_game_list(Http& http, const std::string& list_id,
+                                         const std::string& market = "US");
 
 // An Xbox console linked to the account, streamable over xHome (remote play).
 struct HomeConsole {

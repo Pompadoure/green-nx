@@ -58,6 +58,8 @@ bool Names::pump(std::vector<Game>& games) {
         game.name = found->second->name;
         game.box_art_url = found->second->box_art_url;
         game.icon_url = found->second->icon_url;
+        game.hero_url = found->second->hero_url;
+        game.genres = found->second->genres;
         changed = true;
     }
     return changed;
