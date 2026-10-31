@@ -211,6 +211,7 @@ void remember_gamertag(const std::string& gamertag) {
 // ---- Switch joystick button indices (libnx SDL2 port) ---------------------
 enum JoyButton {
     kBtnA = 0, kBtnB = 1, kBtnX = 2, kBtnY = 3,
+    kBtnLStick = 4,
     kBtnL = 6, kBtnR = 7, kBtnZL = 8, kBtnZR = 9,
     kBtnPlus = 10, kBtnMinus = 11,
     kBtnLeft = 12, kBtnUp = 13, kBtnRight = 14, kBtnDown = 15,
@@ -424,7 +425,10 @@ struct App {
     std::string query;
     int cursor = 0;
     LibraryTab tab = LibraryTab::Home;
-    std::string genre;  // All games filter, set from a Home genre tile
+    std::string genre;  // All games filter
+    bool genre_from_home = false;  // B leaves the filter and returns to Home
+    bool filter_open = false;      // All games: genre picker is showing
+    int filter_cursor = 0;
     std::vector<HomeRow> home_rows;
     int home_row = 0;          // focused row
     float home_scroll = 0;     // eased vertical offset, pixels
@@ -1201,6 +1205,20 @@ void draw_focus_frames(App& app, const SDL_Rect& r) {
                   {gfx::kFocus.r, gfx::kFocus.g, gfx::kFocus.b, 38}, 8);
 }
 
+// Shorten text to max_w with an ellipsis, on UTF-8 character boundaries.
+std::string fit_text(App& app, const std::string& text, int max_w,
+                     gfx::FontSize size) {
+    if (app.gfx.text_width(text, size) <= max_w) return text;
+    std::string cut = text;
+    while (!cut.empty()) {
+        while (!cut.empty() && (cut.back() & 0xC0) == 0x80) cut.pop_back();
+        if (!cut.empty()) cut.pop_back();
+        while (!cut.empty() && cut.back() == ' ') cut.pop_back();
+        if (app.gfx.text_width(cut + "…", size) <= max_w) return cut + "…";
+    }
+    return "…";
+}
+
 // The Xbox sphere on an accent square.
 void draw_logo(App& app, const SDL_Rect& rect) {
     app.gfx.fill(rect, gfx::kAccent);
@@ -1550,7 +1568,9 @@ void draw_card(App& app, const Game& game, const SDL_Rect& card,
         app.gfx.fill(plate, gfx::kSurface);
         const std::string& label =
             game.name.empty() ? game.title_id : game.name;
-        app.gfx.text_centered(label.substr(0, 24), plate.x + plate.w / 2,
+        app.gfx.text_centered(fit_text(app, label, plate.w - 24,
+                                       gfx::FontSize::Small),
+                              plate.x + plate.w / 2,
                               plate.y + 8, gfx::FontSize::Small, gfx::kText);
     }
 }
@@ -1623,9 +1643,37 @@ void draw_hero_card(App& app, const Game& game, const SDL_Rect& card,
         app.gfx.fill(plate, gfx::kSurface);
         const std::string& label =
             game.name.empty() ? game.title_id : game.name;
-        app.gfx.text_centered(label.substr(0, 40), plate.x + plate.w / 2,
+        app.gfx.text_centered(fit_text(app, label, plate.w - 24,
+                                       gfx::FontSize::Small),
+                              plate.x + plate.w / 2,
                               plate.y + 8, gfx::FontSize::Small, gfx::kText);
     }
+}
+
+// A genre tile's label: one line if it fits, otherwise split over two.
+void draw_tile_label(App& app, const std::string& label, const SDL_Rect& card) {
+    constexpr gfx::FontSize kSize = gfx::FontSize::Small;
+    const int room = card.w - 48;
+    const int cx = card.x + card.w / 2;
+    if (app.gfx.text_width(label, kSize) <= room) {
+        app.gfx.text_centered(label, cx, card.y + 34, kSize, gfx::kText);
+        return;
+    }
+    size_t split = std::string::npos;
+    for (size_t space = label.find(' '); space != std::string::npos;
+         space = label.find(' ', space + 1)) {
+        if (app.gfx.text_width(label.substr(0, space), kSize) <= room)
+            split = space;
+    }
+    if (split == std::string::npos) {
+        app.gfx.text_centered(fit_text(app, label, room, kSize), cx,
+                              card.y + 34, kSize, gfx::kText);
+        return;
+    }
+    app.gfx.text_centered(label.substr(0, split), cx, card.y + 16, kSize,
+                          gfx::kText);
+    app.gfx.text_centered(fit_text(app, label.substr(split + 1), room, kSize),
+                          cx, card.y + 54, kSize, gfx::kText);
 }
 
 // Ask for art just outside the view, ahead of the cards on screen: the cover
@@ -1691,9 +1739,7 @@ void draw_home(App& app) {
             if (row.kind == HomeKind::Tiles) {
                 app.gfx.fill(card, focused ? gfx::kSurfaceHi : gfx::kSurface);
                 app.gfx.fill({card.x, card.y, 8, card.h}, gfx::kAccent);
-                app.gfx.text_centered(row.tiles[i], card.x + card.w / 2,
-                                      card.y + 34, gfx::FontSize::Small,
-                                      gfx::kText);
+                draw_tile_label(app, row.tiles[i], card);
                 if (focused) draw_focus_frames(app, card);
             } else if (row.kind == HomeKind::Hero) {
                 draw_hero_card(app, app.games[row.games[i]], card, focused);
@@ -1721,6 +1767,56 @@ void draw_home(App& app) {
                      {"ZR", "Refresh"},
                      {"ZL", "Settings"},
                      {"+", "Exit"}});
+}
+
+// The genre picker over All games reuses the Home tiles' list: "All games"
+// first, then every genre the account can actually play.
+constexpr int kFilterX = 560;
+constexpr int kFilterY = 130;
+constexpr int kFilterW = 800;
+constexpr int kFilterRowH = 76;
+constexpr int kFilterRows = 9;
+
+const std::vector<std::string>* filter_options(const App& app) {
+    for (const HomeRow& row : app.home_rows)
+        if (row.kind == HomeKind::Tiles) return &row.tiles;
+    return nullptr;
+}
+
+int filter_first_row(const App& app, int count) {
+    return std::clamp(app.filter_cursor - kFilterRows / 2, 0,
+                      std::max(0, count - kFilterRows));
+}
+
+void draw_filter(App& app) {
+    const std::vector<std::string>* options = filter_options(app);
+    if (!options) return;
+    app.gfx.fill({0, 0, gfx::kWidth, kFooterY},
+                 {gfx::kBg.r, gfx::kBg.g, gfx::kBg.b, 200});
+    const int count = static_cast<int>(options->size());
+    const int shown = std::min(count, kFilterRows);
+    app.gfx.fill({kFilterX, kFilterY, kFilterW, 110 + shown * kFilterRowH},
+                 gfx::kSurface);
+    app.gfx.text("Filter by genre", kFilterX + 40, kFilterY + 28,
+                 gfx::FontSize::Body, gfx::kText);
+
+    const int first = filter_first_row(app, count);
+    for (int i = 0; i < shown; ++i) {
+        const int index = first + i;
+        const std::string& label = (*options)[index];
+        const bool active = index == 0 ? app.genre.empty() : app.genre == label;
+        SDL_Rect row = {kFilterX + 24, kFilterY + 100 + i * kFilterRowH,
+                        kFilterW - 48, kFilterRowH - 8};
+        if (index == app.filter_cursor)
+            app.gfx.fill(row, gfx::kSurfaceHi);
+        if (active)
+            app.gfx.fill({row.x, row.y, 8, row.h}, gfx::kAccent);
+        app.gfx.text(fit_text(app, label, row.w - 60, gfx::FontSize::Small),
+                     row.x + 32, row.y + 20, gfx::FontSize::Small,
+                     active ? gfx::kText : gfx::kTextDim);
+        if (index == app.filter_cursor) draw_focus_frames(app, row);
+    }
+    draw_hints(app, {{"A", "Select", true}, {"B", "Close"}});
 }
 
 void draw_library(App& app) {
@@ -1888,11 +1984,13 @@ void draw_library(App& app) {
     }
 
     draw_hints(app, {{"A", "Details", true},
+                     {"LS", app.genre.empty() ? "Filter" : "Filter on"},
                      {"X", "Favorite"},
                      {"Y", "Search"},
                      {"ZR", "Refresh"},
                      {"ZL", "Settings"},
                      {"+", "Exit"}});
+    if (app.filter_open) draw_filter(app);
 }
 
 // Game detail (card 1f): big cover left, title + meta chips + action buttons
@@ -1922,7 +2020,9 @@ void draw_detail(App& app) {
 
     int rx = 790;
     const std::string& title = game.name.empty() ? game.title_id : game.name;
-    app.gfx.text(title.substr(0, 34), rx, 150, gfx::FontSize::Title,
+    app.gfx.text(fit_text(app, title, gfx::kWidth - rx - kMargin,
+                          gfx::FontSize::Title),
+                 rx, 150, gfx::FontSize::Title,
                  gfx::kText);
 
     // Meta chips: kSurface pills with XS text.
@@ -2726,6 +2826,7 @@ struct Input {
     bool up = false, down = false, left = false, right = false;
     bool plus = false, minus = false, zl = false, zr = false;
     bool l = false, r = false;
+    bool lstick = false;           // left stick pressed in
     bool quit = false;
     bool joystick_reopened = false;  // zombie-handle recovery fired this poll
     bool touch = false;            // a finger tapped this frame
@@ -2792,6 +2893,7 @@ Input poll_input(SDL_Joystick*& joystick) {
                 case kBtnZL: input.zl = true; break;
                 case kBtnZR: input.zr = true; break;
                 case kBtnL: input.l = true; break;
+                case kBtnLStick: input.lstick = true; break;
                 case kBtnR: input.r = true; break;
             }
         }
@@ -3069,6 +3171,7 @@ int main(int argc, char** argv) {
                     else if (k == "R") input.r = true;
                     else if (k == "ZL") input.zl = true;
                     else if (k == "ZR") input.zr = true;
+                    else if (k == "LS") input.lstick = true;
                     input.touch = false;  // consumed by the hint bar
                     break;
                 }
@@ -3179,6 +3282,51 @@ int main(int argc, char** argv) {
                 if (app.home_dirty) build_home(app);
                 if (app.tab != LibraryTab::All) app.genre.clear();
 
+                if (app.filter_open) {
+                    const std::vector<std::string>* options =
+                        filter_options(app);
+                    const int count =
+                        options ? static_cast<int>(options->size()) : 0;
+                    if (input.up) --app.filter_cursor;
+                    if (input.down) ++app.filter_cursor;
+                    app.filter_cursor = std::clamp(app.filter_cursor, 0,
+                                                   std::max(0, count - 1));
+                    if (input.touch) {
+                        int row = (input.touch_y - kFilterY - 100) / kFilterRowH;
+                        if (input.touch_x >= kFilterX &&
+                            input.touch_x < kFilterX + kFilterW &&
+                            input.touch_y >= kFilterY + 100 && row < kFilterRows &&
+                            filter_first_row(app, count) + row < count) {
+                            app.filter_cursor =
+                                filter_first_row(app, count) + row;
+                            input.a = true;
+                        }
+                    }
+                    if (input.a && count > 0) {
+                        app.genre = app.filter_cursor == 0
+                                        ? ""
+                                        : (*options)[app.filter_cursor];
+                        app.genre_from_home = false;
+                        app.cursor = 0;
+                        apply_filter(app);
+                        app.filter_open = false;
+                    }
+                    if (input.b || input.lstick) app.filter_open = false;
+                    break;
+                }
+                if (input.lstick && app.tab == LibraryTab::All) {
+                    const std::vector<std::string>* options =
+                        filter_options(app);
+                    app.filter_cursor = 0;
+                    if (options) {
+                        for (int i = 1; i < static_cast<int>(options->size());
+                             ++i)
+                            if ((*options)[i] == app.genre) app.filter_cursor = i;
+                    }
+                    app.filter_open = true;
+                    break;
+                }
+
                 int tabs = app.consoles.empty() ? kTabCount - 1 : kTabCount;
                 bool console_tab = app.tab == LibraryTab::Consoles;
                 bool home_tab = app.tab == LibraryTab::Home;
@@ -3257,7 +3405,9 @@ int main(int argc, char** argv) {
                     break;
                 }
 
-                if (input.b && !app.genre.empty()) {  // back out of a genre
+                // Back out of a genre opened from Home; one picked with the
+                // filter stays until it is changed.
+                if (input.b && !app.genre.empty() && app.genre_from_home) {
                     app.genre.clear();
                     app.tab = LibraryTab::Home;
                     app.cursor = 0;
@@ -3282,6 +3432,7 @@ int main(int argc, char** argv) {
                         // The first tile is the unfiltered list.
                         app.genre =
                             row.column == 0 ? "" : row.tiles[row.column];
+                        app.genre_from_home = row.column != 0;
                         app.tab = LibraryTab::All;
                         app.cursor = 0;
                         apply_filter(app);
